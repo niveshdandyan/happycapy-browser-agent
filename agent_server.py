@@ -719,8 +719,9 @@ def create_llm(model_id: str):
 async def _per_step_judge(agent, judge_llm, task: str) -> None:
     """Called via on_step_end when consensus strategy is active.
 
-    Evaluates the last step and broadcasts the verdict to the dashboard
-    so the user can see live validation while the task runs.
+    Evaluates the last step and broadcasts the verdict to the dashboard.
+    On WARN or FAIL verdicts, injects feedback into the agent's long_term_memory
+    so the executing agent sees the critique and can adjust its approach.
     """
     from browser_use.llm.messages import SystemMessage, UserMessage
 
@@ -765,12 +766,13 @@ async def _per_step_judge(agent, judge_llm, task: str) -> None:
             "You are a browser automation quality judge. After each step you must evaluate whether "
             "the agent is making correct progress toward the task. Respond with EXACTLY this format:\n"
             "VERDICT: PASS | WARN | FAIL\n"
-            "REASON: <one sentence explanation>\n\n"
+            "REASON: <one sentence explanation>\n"
+            "SUGGESTION: <one sentence on what the agent should do differently, or 'none' if PASS>\n\n"
             "Rules:\n"
-            "- PASS: The step clearly advances toward the goal.\n"
+            "- PASS: The step clearly advances toward the goal. SUGGESTION should be 'none'.\n"
             "- WARN: The step is questionable, might be off-track, or sub-optimal but not catastrophic.\n"
             "- FAIL: The step is clearly wrong, navigated to wrong page, filled wrong data, or is stuck in a loop.\n"
-            "Be concise. One sentence reason only."
+            "Be concise. One sentence each."
         ))
 
         user_msg = UserMessage(content=(
@@ -788,6 +790,7 @@ async def _per_step_judge(agent, judge_llm, task: str) -> None:
         # Parse verdict
         verdict = "PASS"
         reason = verdict_text
+        suggestion = ""
         for line in verdict_text.split("\n"):
             line_upper = line.strip().upper()
             if line_upper.startswith("VERDICT:"):
@@ -800,13 +803,38 @@ async def _per_step_judge(agent, judge_llm, task: str) -> None:
                     verdict = "PASS"
             if line.strip().upper().startswith("REASON:"):
                 reason = line.strip()[7:].strip()
+            if line.strip().upper().startswith("SUGGESTION:"):
+                suggestion = line.strip()[11:].strip()
 
         logger.info(f"Judge step {step_num}: {verdict} - {reason}")
+
+        # ── Inject feedback into agent on WARN/FAIL so it adapts ──
+        if verdict in ("WARN", "FAIL"):
+            feedback_msg = (
+                f"[JUDGE FEEDBACK - Step {step_num}: {verdict}] "
+                f"{reason}"
+            )
+            if suggestion and suggestion.lower() != "none":
+                feedback_msg += f" Suggestion: {suggestion}"
+
+            if agent.state.last_result:
+                # Append to existing long_term_memory if present
+                existing = agent.state.last_result[-1].long_term_memory or ""
+                agent.state.last_result[-1].long_term_memory = (
+                    (existing + "\n" + feedback_msg) if existing else feedback_msg
+                )
+            else:
+                from browser_use.agent.views import ActionResult as AR
+                agent.state.last_result = [AR(long_term_memory=feedback_msg)]
+
+            logger.info(f"Judge feedback injected into agent: {feedback_msg[:100]}")
 
         # Store in action log (append to the latest entry)
         if state.action_log:
             state.action_log[-1]["judge_verdict"] = verdict
             state.action_log[-1]["judge_reason"] = reason
+            if suggestion:
+                state.action_log[-1]["judge_suggestion"] = suggestion
 
         # Broadcast judge verdict to dashboard
         msg = json.dumps({
@@ -815,6 +843,7 @@ async def _per_step_judge(agent, judge_llm, task: str) -> None:
                 "step": step_num,
                 "verdict": verdict,
                 "reason": reason,
+                "suggestion": suggestion,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         })
