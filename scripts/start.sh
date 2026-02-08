@@ -56,6 +56,11 @@ if ! command -v convert &>/dev/null; then
     sudo apt-get install -y -qq imagemagick 2>/dev/null || HAS_SCREENSHOT=false
 fi
 
+if ! command -v xsetroot &>/dev/null; then
+    echo "  WARNING: xsetroot not found - installing x11-xserver-utils..."
+    sudo apt-get install -y -qq x11-xserver-utils 2>/dev/null || true
+fi
+
 if [ "$HAS_SCREENSHOT" = true ]; then
     echo "  OK: Screenshot tools available"
 else

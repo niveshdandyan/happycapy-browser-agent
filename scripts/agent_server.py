@@ -220,6 +220,17 @@ document.getElementById('actions').textContent='{actions}';
         logger.warning("Cannot show splash: Chromium binary not found")
         return
 
+    # Set Xvfb root window background to match splash body color so any gaps are invisible
+    splash_bg = "#FDF2F2" if status == "failed" else "#F9F6F1"
+    try:
+        subprocess.run(
+            ["xsetroot", "-solid", splash_bg],
+            env={**os.environ, "DISPLAY": DISPLAY},
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+
     try:
         _SPLASH_PROCESS = subprocess.Popen(
             [
@@ -235,6 +246,7 @@ document.getElementById('actions').textContent='{actions}';
                 "--disable-infobars",
                 f"--user-data-dir=/tmp/splash-chrome-profile",
                 "--kiosk",
+                "--window-position=0,0",
                 f"--window-size={SCREEN_WIDTH},{SCREEN_HEIGHT}",
                 f"file://{splash_path}",
             ],

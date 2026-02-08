@@ -22,7 +22,7 @@ echo ""
 echo "[1/5] Installing system dependencies..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get update -qq
-    sudo apt-get install -y -qq xvfb x11vnc x11-apps imagemagick novnc 2>/dev/null || true
+    sudo apt-get install -y -qq xvfb x11vnc x11-apps imagemagick novnc x11-xserver-utils 2>/dev/null || true
     echo "  OK"
 elif command -v apk &>/dev/null; then
     apk add --no-cache xvfb x11vnc imagemagick novnc 2>/dev/null || true
