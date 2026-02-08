@@ -984,28 +984,86 @@ h4 {
   flex-shrink: 0;
 }
 
-.log-thought {
+.log-reasoning {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.log-evaluation {
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  background: rgba(16, 185, 129, 0.08);
+  border-left: 2px solid rgba(16, 185, 129, 0.4);
+  color: var(--color-text-secondary);
+}
+
+.log-evaluation.eval-failure {
+  background: rgba(239, 68, 68, 0.08);
+  border-left-color: rgba(239, 68, 68, 0.4);
+}
+
+.log-evaluation .eval-label {
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: rgba(16, 185, 129, 0.8);
+  margin-right: var(--space-1);
+}
+
+.log-evaluation.eval-failure .eval-label {
+  color: rgba(239, 68, 68, 0.8);
+}
+
+.log-next-goal {
   font-size: var(--font-size-sm);
   color: var(--color-text-primary);
   line-height: 1.5;
-  margin-bottom: var(--space-2);
+  font-weight: 500;
+}
+
+.log-thought {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.4;
+  font-style: italic;
+}
+
+.log-memory {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  line-height: 1.4;
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-md);
+}
+
+.log-memory .memory-label {
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-muted);
+  margin-right: var(--space-1);
 }
 
 .log-actions {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: var(--space-1);
 }
 
 .log-action {
   font-size: var(--font-size-xs);
-  font-family: var(--font-mono);
   color: var(--color-warning);
-  padding: 3px var(--space-2);
+  padding: 2px var(--space-2);
   background: var(--color-warning-bg);
-  border-radius: var(--radius-md);
-  overflow: hidden;
-  text-overflow: ellipsis;
+  border-radius: var(--radius-full);
   white-space: nowrap;
 }
 
@@ -1614,16 +1672,52 @@ h4 {
       const time = new Date(data.timestamp).toLocaleTimeString();
       const url = data.url ? data.url.replace(/^https?:\/\//, '').substring(0, 50) : '';
 
+      // Use human-readable action summaries if available, fall back to raw actions
+      const displayActions = data.action_summaries && data.action_summaries.length > 0
+        ? data.action_summaries
+        : (data.actions || []);
+
       let actionsHtml = '';
-      if (data.actions && data.actions.length > 0) {
+      if (displayActions.length > 0) {
         actionsHtml = '<div class="log-actions">' +
-          data.actions.map(a => `<div class="log-action">${escapeHtml(String(a).substring(0, 120))}</div>`).join('') +
+          displayActions.map(a => `<span class="log-action">${escapeHtml(String(a))}</span>`).join('') +
           '</div>';
       }
 
       const modelTag = data.model
         ? `<span class="log-model">${escapeHtml(data.model.split('/').pop())}</span>`
         : '';
+
+      // Build reasoning section (evaluation, next_goal, thought, memory)
+      let reasoningHtml = '';
+      const parts = [];
+
+      // Evaluation of previous goal
+      if (data.evaluation) {
+        const isFailure = /fail|not |unable|error|wrong/i.test(data.evaluation);
+        parts.push(`<div class="log-evaluation ${isFailure ? 'eval-failure' : ''}">` +
+          `<span class="eval-label">${isFailure ? 'Previous step' : 'Previous step'}</span>` +
+          `${escapeHtml(data.evaluation)}</div>`);
+      }
+
+      // Next goal -- the main human-readable intent
+      if (data.next_goal) {
+        parts.push(`<div class="log-next-goal">${escapeHtml(data.next_goal)}</div>`);
+      }
+
+      // Thinking / internal reasoning (shown smaller)
+      if (data.thought && data.thought !== data.next_goal) {
+        parts.push(`<div class="log-thought">${escapeHtml(data.thought)}</div>`);
+      }
+
+      // Memory
+      if (data.memory) {
+        parts.push(`<div class="log-memory"><span class="memory-label">Memory</span>${escapeHtml(data.memory)}</div>`);
+      }
+
+      if (parts.length > 0) {
+        reasoningHtml = '<div class="log-reasoning">' + parts.join('') + '</div>';
+      }
 
       // If log entry already has judge verdict (replayed from server), include it
       let judgeHtml = '';
@@ -1644,7 +1738,7 @@ h4 {
           ${url ? `<span class="log-url">${escapeHtml(url)}</span>` : ''}
           <span class="log-timestamp">${time}</span>
         </div>
-        ${data.thought ? `<div class="log-thought">${escapeHtml(data.thought)}</div>` : ''}
+        ${reasoningHtml}
         ${actionsHtml}
         ${judgeHtml}
         ${councilHtml}

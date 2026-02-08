@@ -284,6 +284,79 @@ async def screenshot_broadcast_loop():
             await asyncio.sleep(1)
 
 
+# ─── Action Summary Helper ────────────────────────────────────────────────────
+
+def _summarize_action(act) -> str:
+    """Convert a browser-use ActionModel into a short human-readable description."""
+    try:
+        raw = str(act)
+        # Navigate
+        if "NavigateAction" in raw:
+            url = getattr(act, "navigate", None)
+            if url and hasattr(url, "url"):
+                return f"Navigate to {url.url}"
+            # fallback: parse from string
+            import re
+            m = re.search(r"url='([^']*)'", raw)
+            if m:
+                return f"Navigate to {m.group(1)}"
+            return "Navigate to page"
+
+        # Click
+        if "ClickAction" in raw or "ClickElement" in raw:
+            idx_match = None
+            import re
+            idx_match = re.search(r"index=(\d+)", raw)
+            idx = idx_match.group(1) if idx_match else "?"
+            return f"Click element [{idx}]"
+
+        # Input / type text
+        if "InputTextAction" in raw or "InputAction" in raw:
+            import re
+            idx_match = re.search(r"index=(\d+)", raw)
+            text_match = re.search(r"text='([^']*)'", raw)
+            idx = idx_match.group(1) if idx_match else "?"
+            text = text_match.group(1)[:40] if text_match else "..."
+            return f"Type \"{text}\" into element [{idx}]"
+
+        # Scroll
+        if "ScrollAction" in raw:
+            direction = "down" if "down=True" in raw else "up"
+            return f"Scroll {direction}"
+
+        # Extract / read content
+        if "ExtractAction" in raw:
+            return "Extract page content"
+
+        # Done
+        if "DoneAction" in raw:
+            import re
+            text_match = re.search(r"text=['\"]([^'\"]{0,60})", raw)
+            if text_match:
+                return f"Done: {text_match.group(1)}..."
+            return "Task completed"
+
+        # GoBack
+        if "GoBack" in raw:
+            return "Go back"
+
+        # SendKeys
+        if "SendKeys" in raw or "KeyAction" in raw:
+            import re
+            key_match = re.search(r"keys?='([^']*)'", raw)
+            key = key_match.group(1) if key_match else "keys"
+            return f"Press {key}"
+
+        # Tab actions
+        if "SwitchTab" in raw or "NewTab" in raw:
+            return "Switch browser tab"
+
+        # Fallback: truncate raw string
+        return raw[:80]
+    except Exception:
+        return str(act)[:80]
+
+
 # ─── Agent Step Callback ───────────────────────────────────────────────────────
 
 async def on_agent_step(browser_state, agent_output, step_number):
@@ -292,18 +365,51 @@ async def on_agent_step(browser_state, agent_output, step_number):
     state.last_step_start_time = time.monotonic()
     state.last_step_number = step_number
 
-    # Extract action info
+    # Extract action info -- both raw and human-readable summaries
     actions = []
+    action_summaries = []
     if agent_output and hasattr(agent_output, "action") and agent_output.action:
         action_list = agent_output.action if isinstance(agent_output.action, list) else [agent_output.action]
         for act in action_list:
             actions.append(str(act))
+            action_summaries.append(_summarize_action(act))
 
+    # Extract reasoning fields from AgentOutput
     thought = ""
-    if agent_output and hasattr(agent_output, "current_state"):
-        cs = agent_output.current_state
-        if hasattr(cs, "thought") and cs.thought:
-            thought = cs.thought
+    evaluation = ""
+    next_goal = ""
+    memory = ""
+    if agent_output:
+        # Direct fields on AgentOutput (browser-use 0.11.9)
+        if hasattr(agent_output, "thinking") and agent_output.thinking:
+            thought = agent_output.thinking
+        elif hasattr(agent_output, "current_state"):
+            cs = agent_output.current_state
+            if hasattr(cs, "thinking") and cs.thinking:
+                thought = cs.thinking
+            elif hasattr(cs, "thought") and cs.thought:
+                thought = cs.thought
+
+        if hasattr(agent_output, "evaluation_previous_goal") and agent_output.evaluation_previous_goal:
+            evaluation = agent_output.evaluation_previous_goal
+        elif hasattr(agent_output, "current_state"):
+            cs = agent_output.current_state
+            if hasattr(cs, "evaluation_previous_goal") and cs.evaluation_previous_goal:
+                evaluation = cs.evaluation_previous_goal
+
+        if hasattr(agent_output, "next_goal") and agent_output.next_goal:
+            next_goal = agent_output.next_goal
+        elif hasattr(agent_output, "current_state"):
+            cs = agent_output.current_state
+            if hasattr(cs, "next_goal") and cs.next_goal:
+                next_goal = cs.next_goal
+
+        if hasattr(agent_output, "memory") and agent_output.memory:
+            memory = agent_output.memory
+        elif hasattr(agent_output, "current_state"):
+            cs = agent_output.current_state
+            if hasattr(cs, "memory") and cs.memory:
+                memory = cs.memory
 
     # Determine current model (may change mid-run for fallback_chain)
     current_model = state.active_primary_model
@@ -314,7 +420,11 @@ async def on_agent_step(browser_state, agent_output, step_number):
         "step": step_number,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "thought": thought,
+        "evaluation": evaluation,
+        "next_goal": next_goal,
+        "memory": memory,
         "actions": actions,
+        "action_summaries": action_summaries,
         "url": getattr(browser_state, "url", "") if browser_state else "",
         "model": current_model,
         "strategy": state.active_strategy,
