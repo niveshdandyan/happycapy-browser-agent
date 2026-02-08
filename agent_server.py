@@ -675,6 +675,80 @@ async def on_agent_step(browser_state, agent_output, step_number):
 
     logger.info(f"Step {step_number}: {thought[:100]}..." if thought else f"Step {step_number}")
 
+    # ── Grounding verification: detect common failures and inject corrective feedback ──
+    await _verify_grounding(state.agent, log_entry, step_number)
+
+
+async def _verify_grounding(agent, log_entry: dict, step_number: int):
+    """Detect grounding failures after each step and inject corrective hints."""
+    if not agent:
+        return
+
+    history = agent.history
+    if not history or not history.history:
+        return
+
+    hints = []
+    last_step = history.history[-1]
+
+    # Check 1: Action errors (element not found, stale index, etc.)
+    for r in last_step.result:
+        if r.error:
+            err = str(r.error).lower()
+            if "not available" in err or "not found" in err or "no element" in err:
+                hints.append(
+                    "GROUNDING: An element index was stale or unavailable. "
+                    "The page likely changed since last observation. "
+                    "Look at the CURRENT element list carefully before choosing an index."
+                )
+            elif "timeout" in err:
+                hints.append(
+                    "GROUNDING: Action timed out. The element may be obscured by an overlay, "
+                    "modal, or cookie banner. Check if something is blocking the target element."
+                )
+
+    # Check 2: Repeated same action (grounding loop - clicking same thing)
+    if len(history.history) >= 3:
+        recent_actions = []
+        for h in history.history[-3:]:
+            if h.model_output and hasattr(h.model_output, "action") and h.model_output.action:
+                recent_actions.append(str(h.model_output.action[0]) if h.model_output.action else "")
+        if len(recent_actions) == 3 and recent_actions[0] == recent_actions[1] == recent_actions[2]:
+            hints.append(
+                "GROUNDING: You have repeated the exact same action 3 times in a row. "
+                "This means the action is not having the expected effect. "
+                "Try a completely different approach: use a different element, scroll, "
+                "or use extract to understand the page structure better."
+            )
+
+    # Check 3: URL unchanged after navigation-like action
+    if len(history.history) >= 2:
+        prev_url = getattr(history.history[-2].state, "url", "") if history.history[-2].state else ""
+        curr_url = getattr(last_step.state, "url", "") if last_step.state else ""
+        # Check if the action was a click or navigate but URL didn't change
+        actions_desc = ""
+        if last_step.model_output and hasattr(last_step.model_output, "action"):
+            actions_desc = str(last_step.model_output.action).lower()
+        if ("navigate" in actions_desc or "go_to" in actions_desc) and prev_url == curr_url and curr_url:
+            hints.append(
+                "GROUNDING: You attempted navigation but the URL did not change. "
+                "The navigation may have failed or been blocked. "
+                "Verify the URL is correct and try again, or check for redirects."
+            )
+
+    # Inject hints into agent's long_term_memory if any issues detected
+    if hints:
+        combined = "\n".join(hints)
+        if agent.state.last_result:
+            existing = agent.state.last_result[-1].long_term_memory or ""
+            agent.state.last_result[-1].long_term_memory = (
+                (existing + "\n" + combined) if existing else combined
+            )
+        else:
+            from browser_use.agent.views import ActionResult as AR
+            agent.state.last_result = [AR(long_term_memory=combined)]
+        logger.info(f"Grounding hints injected at step {step_number}: {combined[:150]}")
+
 
 # ─── Request Models ──────────────────────────────────────────────────────────────
 
@@ -1614,6 +1688,27 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
         # ── Strategy-specific Agent kwargs ──
         extra_kwargs = {}
 
+        # ── Grounding instructions (all strategies) ──
+        grounding_prompt = (
+            "\n\n## GROUNDING RULES (follow strictly)\n"
+            "1. ALWAYS verify the current page state before acting. Read the element list carefully.\n"
+            "2. Use the screenshot as your GROUND TRUTH. If the screenshot shows something different "
+            "from what you expect, trust the screenshot.\n"
+            "3. When filling forms, verify each field AFTER entering data by checking the element's "
+            "value attribute or the screenshot.\n"
+            "4. If an action fails or has no effect, do NOT repeat it. Try a different approach:\n"
+            "   - Use a different element index\n"
+            "   - Scroll to reveal hidden elements\n"
+            "   - Use extract to understand the page structure\n"
+            "   - Check for overlays, modals, or cookie banners blocking your target\n"
+            "5. After clicking a button that should navigate or submit, check if the URL or page "
+            "content actually changed.\n"
+            "6. Pay attention to element attributes (id, name, type, placeholder, aria-label) to "
+            "identify the correct element. Do not guess based on index numbers alone.\n"
+            "7. If you see a GROUNDING feedback message in memory, follow its guidance immediately.\n"
+        )
+        extra_kwargs["extend_system_message"] = grounding_prompt
+
         if strategy == "fallback_chain" and secondary_llm:
             extra_kwargs["fallback_llm"] = secondary_llm
 
@@ -1642,7 +1737,7 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
                 planner_label = primary_id
 
             state.generated_plan = plan_text
-            extra_kwargs["extend_system_message"] = (
+            extra_kwargs["extend_system_message"] = extra_kwargs.get("extend_system_message", "") + (
                 "\n\n## HIGH-LEVEL PLAN (from planning model)\n"
                 "Follow this plan step-by-step. Adapt if pages differ from expectations.\n\n"
                 + plan_text
@@ -1702,8 +1797,16 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
             browser_session=browser_session,
             register_new_step_callback=on_agent_step,
             use_vision=True,
-            max_actions_per_step=3,
+            # Grounding: keep to 1 action per step so each action sees fresh DOM state.
+            # Multi-action batching causes stale indices when earlier actions change the page.
+            max_actions_per_step=1,
             generate_gif=False,
+            # Grounding: include key HTML attributes in element representation so the LLM
+            # can distinguish similar elements (e.g., multiple <input> fields on a form).
+            include_attributes=["id", "name", "type", "placeholder", "aria-label", "role", "href", "value"],
+            # Grounding: include recent browser events (clicks, navigations) so the LLM
+            # sees what just happened on the page.
+            include_recent_events=True,
             **extra_kwargs,
         )
         state.agent = agent
