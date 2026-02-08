@@ -327,6 +327,7 @@ class AgentState:
         self.active_primary_model = ""
         self.active_secondary_model = ""
         self.active_council_members: list[str] = []
+        self.generated_plan: str = ""  # plan text from planner_executor strategy
         self.last_step_start_time: float = 0.0  # monotonic timestamp of when current step began
         self.last_step_number: int = 0           # step number currently in progress
         self.stall_council_fired_for_step: int = -1  # step number we already fired stall council for
@@ -1306,7 +1307,7 @@ async def _generate_plan(planner_llm, task: str) -> str:
     try:
         response = await planner_llm.ainvoke([system_msg, user_msg])
         plan_text = response.completion
-        logger.info(f"Generated plan ({len(plan_text)} chars) for task")
+        logger.info(f"Generated plan ({len(plan_text)} chars):\n{plan_text}")
         return plan_text
     except Exception as e:
         logger.warning(f"Plan generation failed ({e}), using generic plan")
@@ -1354,12 +1355,30 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
         state.active_primary_model = primary_id
         state.active_secondary_model = secondary_id
         state.active_council_members = []
+        state.generated_plan = ""
 
         logger.info(f"Strategy={strategy} | Primary={primary_id} | Secondary={secondary_id}")
 
         # ── Create LLM instances ──
         primary_llm = create_llm(primary_id)
         secondary_llm = create_llm(secondary_id) if secondary_id else None
+
+        # Warn if a multi-model strategy was chosen but secondary is missing
+        if strategy in ("fallback_chain", "planner_executor", "consensus") and not secondary_llm:
+            logger.warning(
+                f"Strategy '{strategy}' requires a secondary model but none was provided. "
+                f"Falling back to single-model behavior."
+            )
+            # Broadcast warning to dashboard
+            warn_msg = json.dumps({
+                "type": "warning",
+                "data": {"message": f"Strategy '{strategy}' requires a secondary model. Running as single model."},
+            })
+            for ws in state.ws_clients:
+                try:
+                    await ws.send_text(warn_msg)
+                except Exception:
+                    pass
 
         # ── Strategy-specific Agent kwargs ──
         extra_kwargs = {}
@@ -1369,12 +1388,30 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
 
         elif strategy == "planner_executor" and secondary_llm:
             plan_text = await _generate_plan(secondary_llm, task)
+            state.generated_plan = plan_text
             extra_kwargs["extend_system_message"] = (
                 "\n\n## HIGH-LEVEL PLAN (from planning model)\n"
                 "Follow this plan step-by-step. Adapt if pages differ from expectations.\n\n"
                 + plan_text
             )
             extra_kwargs["page_extraction_llm"] = secondary_llm
+            # Broadcast the generated plan to the dashboard
+            plan_msg = json.dumps({
+                "type": "plan",
+                "data": {
+                    "plan": plan_text,
+                    "planner_model": secondary_id,
+                    "executor_model": primary_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            })
+            disconnected = set()
+            for ws in state.ws_clients:
+                try:
+                    await ws.send_text(plan_msg)
+                except Exception:
+                    disconnected.add(ws)
+            state.ws_clients -= disconnected
 
         elif strategy == "consensus" and secondary_llm:
             # Keep end-of-task judge for final verdict
@@ -1498,6 +1535,7 @@ async def broadcast_status():
             "primary_model": state.active_primary_model,
             "secondary_model": state.active_secondary_model,
             "council_members": state.active_council_members,
+            "generated_plan": state.generated_plan,
         },
     })
     disconnected = set()
@@ -1567,6 +1605,7 @@ async def get_status():
         "primary_model": state.active_primary_model,
         "secondary_model": state.active_secondary_model,
         "council_members": state.active_council_members,
+        "generated_plan": state.generated_plan,
     }
 
 
@@ -1620,6 +1659,7 @@ async def websocket_endpoint(ws: WebSocket):
             "primary_model": state.active_primary_model,
             "secondary_model": state.active_secondary_model,
             "council_members": state.active_council_members,
+            "generated_plan": state.generated_plan,
         },
     }))
 
