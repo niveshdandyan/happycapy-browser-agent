@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -1536,9 +1537,11 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
     state.action_log = []
     state.step_count = 0
     state.result = None
+    state.generated_plan = ""
+    state.plan_progress = []
     _last_loop_council_step = 0
 
-    # Broadcast status change
+    # Broadcast status change (with cleared plan/log so frontend drops stale data)
     await broadcast_status()
 
     try:
@@ -1555,8 +1558,6 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
         state.active_primary_model = primary_id
         state.active_secondary_model = secondary_id
         state.active_council_members = []
-        state.generated_plan = ""
-        state.plan_progress = []
 
         logger.info(f"Strategy={strategy} | Primary={primary_id} | Secondary={secondary_id}")
 
@@ -1617,6 +1618,8 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
                 "Follow this plan step-by-step. Adapt if pages differ from expectations.\n\n"
                 + plan_text
             )
+            # Enable planning so browser-use tracks plan step progress (done/current/pending)
+            extra_kwargs["enable_planning"] = True
             if secondary_llm:
                 extra_kwargs["page_extraction_llm"] = secondary_llm
 
@@ -1675,6 +1678,28 @@ async def run_agent(task: str, max_steps: int = 50, model_cfg: Optional[ModelCon
             **extra_kwargs,
         )
         state.agent = agent
+
+        # ── Seed agent's plan from our generated plan (planner_executor) ──
+        if strategy == "planner_executor" and state.generated_plan:
+            from browser_use.agent.views import PlanItem
+            plan_lines = [
+                line.strip()
+                for line in state.generated_plan.split("\n")
+                if line.strip() and re.match(r"^\d+[\.\)]", line.strip())
+            ]
+            plan_steps_text = [re.sub(r"^\d+[\.\)]\s*", "", ln) for ln in plan_lines]
+            if plan_steps_text:
+                agent.state.plan = [PlanItem(text=t) for t in plan_steps_text]
+                agent.state.plan[0].status = "current"
+                # Broadcast initial plan_progress so Plan tab shows progress immediately
+                initial_progress = [{"text": item.text, "status": item.status} for item in agent.state.plan]
+                state.plan_progress = initial_progress
+                pp_msg = json.dumps({"type": "plan_progress", "data": {"items": initial_progress, "step": 0}})
+                for ws in state.ws_clients:
+                    try:
+                        await ws.send_text(pp_msg)
+                    except Exception:
+                        pass
 
         # ── Build run() kwargs (per-step hooks for consensus / council) ──
         run_kwargs = {"max_steps": max_steps}
@@ -1788,10 +1813,21 @@ async def _kill_browser_session():
     """Kill the persistent browser session and clear previous task context."""
     if state.browser_session:
         try:
+            # First try graceful stop, then force kill
             state.browser_session.browser_profile.keep_alive = False
+            try:
+                await state.browser_session.stop()
+            except Exception:
+                pass
             await state.browser_session.kill()
         except Exception as e:
             logger.warning(f"Error killing browser session: {e}")
+            # Fallback: try to kill underlying browser process directly
+            try:
+                if hasattr(state.browser_session, '_browser_pid') and state.browser_session._browser_pid:
+                    os.kill(state.browser_session._browser_pid, signal.SIGKILL)
+            except Exception:
+                pass
         state.browser_session = None
         logger.info("Browser session killed for new session")
     # Clear previous task context since we're starting fresh
@@ -1840,7 +1876,16 @@ async def new_browser_session():
             content={"status": "error", "message": "Cannot reset session while a task is running"},
         )
     await _kill_browser_session()
+    # Clear stale task data so dashboard shows clean state
+    state.generated_plan = ""
+    state.plan_progress = []
+    state.action_log = []
+    state.status = "idle"
+    state.current_task_text = ""
+    state.result = None
+    state.step_count = 0
     _show_splash(status="idle")
+    await broadcast_status()
     return {"status": "ok", "message": "Browser session cleared"}
 
 

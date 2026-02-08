@@ -1924,6 +1924,20 @@ h4 {
         modelInfoRow.style.display = 'none';
       }
 
+      // Handle plan data from status messages
+      if (data.status === 'running' && !data.generated_plan && (!data.plan_progress || data.plan_progress.length === 0)) {
+        // New task just started, no plan yet -- clear any stale plan display
+        const planContent = document.getElementById('planContent');
+        if (planContent && planContent.querySelector('.plan-step')) {
+          planContent.querySelectorAll('.plan-step, .plan-header, .council-vote-summary').forEach(el => el.remove());
+          const emptyPlan = document.getElementById('emptyPlan');
+          if (emptyPlan) emptyPlan.style.display = '';
+          const tabPlan = document.getElementById('tabPlan');
+          if (tabPlan) tabPlan.textContent = 'Plan';
+          window._planSteps = null;
+        }
+      }
+
       // Show generated plan in log (from status, for late-joining clients)
       if (data.generated_plan && data.strategy === 'planner_executor' && !document.querySelector('.log-plan')) {
         showPlanInLog({
@@ -2109,11 +2123,12 @@ h4 {
       const planContent = document.getElementById('planContent');
       const emptyPlan = document.getElementById('emptyPlan');
 
-      // If Plan tab has no steps yet (browser-use generated plan, not planner_executor),
-      // build plan items from the progress data
-      if (!planContent.querySelector('.plan-step')) {
+      // Build or rebuild plan steps in the Plan tab
+      const existingSteps = planContent.querySelectorAll('.plan-step');
+      if (existingSteps.length === 0) {
+        // No steps yet -- create them from scratch
         if (emptyPlan) emptyPlan.style.display = 'none';
-        planContent.querySelectorAll('.plan-header').forEach(el => el.remove());
+        planContent.querySelectorAll('.plan-header, .council-vote-summary').forEach(el => el.remove());
         const header = document.createElement('div');
         header.className = 'plan-header';
         header.innerHTML = `
@@ -2124,7 +2139,7 @@ h4 {
 
         items.forEach((item, i) => {
           const step = document.createElement('div');
-          step.className = 'plan-step step-pending';
+          step.className = `plan-step step-${item.status || 'pending'}`;
           step.id = `plan-step-${i}`;
           step.innerHTML = `
             <div class="plan-step-indicator"></div>
@@ -2132,46 +2147,48 @@ h4 {
           `;
           planContent.appendChild(step);
         });
-      }
+      } else {
+        // Steps exist -- update in place, handling size/text changes
+        // Update existing steps
+        items.forEach((item, i) => {
+          let stepEl = document.getElementById(`plan-step-${i}`);
+          if (!stepEl) {
+            // Plan grew -- add new step
+            stepEl = document.createElement('div');
+            stepEl.id = `plan-step-${i}`;
+            stepEl.innerHTML = `
+              <div class="plan-step-indicator"></div>
+              <div class="plan-step-text">${escapeHtml(item.text)}</div>
+            `;
+            planContent.appendChild(stepEl);
+          }
+          const validStatuses = ['done', 'current', 'pending', 'skipped'];
+          const status = validStatuses.includes(item.status) ? item.status : 'pending';
+          stepEl.className = `plan-step step-${status}`;
+          // Update text if plan was replaced (council replan)
+          const textEl = stepEl.querySelector('.plan-step-text');
+          if (textEl && textEl.textContent !== item.text) {
+            textEl.textContent = item.text;
+          }
+        });
 
-      // Update statuses
-      let doneCount = 0;
-      items.forEach((item, i) => {
-        const stepEl = document.getElementById(`plan-step-${i}`);
-        if (!stepEl) return;
-        stepEl.className = `plan-step step-${item.status}`;
-        // Update text if plan was replaced
-        const textEl = stepEl.querySelector('.plan-step-text');
-        if (textEl && textEl.textContent !== item.text) {
-          textEl.textContent = item.text;
+        // Remove extra steps if plan shrunk
+        let idx = items.length;
+        while (document.getElementById(`plan-step-${idx}`)) {
+          document.getElementById(`plan-step-${idx}`).remove();
+          idx++;
         }
-        if (item.status === 'done') doneCount++;
-      });
-
-      // Remove extra steps if plan shrunk
-      let idx = items.length;
-      while (document.getElementById(`plan-step-${idx}`)) {
-        document.getElementById(`plan-step-${idx}`).remove();
-        idx++;
       }
 
-      // Add new steps if plan grew
-      for (let i = planContent.querySelectorAll('.plan-step').length; i < items.length; i++) {
-        const step = document.createElement('div');
-        step.className = `plan-step step-${items[i].status}`;
-        step.id = `plan-step-${i}`;
-        step.innerHTML = `
-          <div class="plan-step-indicator"></div>
-          <div class="plan-step-text">${escapeHtml(items[i].text)}</div>
-        `;
-        planContent.appendChild(step);
-      }
+      // Count done steps
+      let doneCount = 0;
+      items.forEach(item => { if (item.status === 'done') doneCount++; });
 
       // Update counter
       const counter = document.getElementById('planCounter');
       if (counter) counter.textContent = `${doneCount}/${items.length} done`;
 
-      // Show plan tab badge if plan exists
+      // Update plan tab badge
       const tabPlan = document.getElementById('tabPlan');
       if (tabPlan && items.length > 0) {
         tabPlan.textContent = `Plan (${doneCount}/${items.length})`;
@@ -2366,6 +2383,38 @@ h4 {
     }
 
     // ─── Task Control ───────────────────────────
+    function resetUIForNewTask() {
+      // Clear activity log
+      const log = document.getElementById('actionLog');
+      log.innerHTML = `
+        <div id="emptyLog" class="empty-log">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.3">
+            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+          </svg>
+          <span>Starting new task...</span>
+        </div>
+      `;
+      totalActions = 0;
+      document.getElementById('actionCount').textContent = '0';
+
+      // Clear plan tab
+      const planContent = document.getElementById('planContent');
+      if (planContent) {
+        planContent.querySelectorAll('.plan-step, .plan-header, .council-vote-summary').forEach(el => el.remove());
+        const emptyPlan = document.getElementById('emptyPlan');
+        if (emptyPlan) emptyPlan.style.display = '';
+      }
+      const tabPlan = document.getElementById('tabPlan');
+      if (tabPlan) tabPlan.textContent = 'Plan';
+      window._planSteps = null;
+
+      // Clear result card
+      document.getElementById('resultCard').classList.remove('visible');
+
+      // Switch to activity tab
+      switchTab('activity');
+    }
+
     function startTask() {
       const task = document.getElementById('taskInput').value.trim();
       if (!task) { document.getElementById('taskInput').focus(); return; }
@@ -2396,6 +2445,9 @@ h4 {
 
       const newSession = document.getElementById('newSessionCheck').checked;
 
+      // Clear old task data BEFORE starting new task
+      resetUIForNewTask();
+
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'start_task',
@@ -2404,10 +2456,6 @@ h4 {
           model_config: modelConfig,
           new_session: newSession,
         }));
-        // Reset UI
-        document.getElementById('resultCard').classList.remove('visible');
-        totalActions = 0;
-        document.getElementById('actionCount').textContent = '0';
       } else {
         // Fallback to HTTP
         fetch('/api/agent/start', {
