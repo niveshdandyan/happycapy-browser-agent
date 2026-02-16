@@ -458,26 +458,15 @@ def start_novnc():
 async def take_screenshot() -> Optional[str]:
     """Capture screenshot from Xvfb display, return as base64 PNG."""
     try:
+        # Use ImageMagick 'import' to capture the root window directly as PNG
         proc = await asyncio.create_subprocess_exec(
-            "xwd", "-root", "-display", DISPLAY, "-silent",
+            "import", "-display", DISPLAY, "-window", "root", "png:-",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        png_data, stderr = await proc.communicate()
 
-        if proc.returncode != 0 or not stdout:
-            return None
-
-        # Convert XWD to PNG at native resolution
-        proc2 = await asyncio.create_subprocess_exec(
-            "convert", "xwd:-", "png:-",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        png_data, _ = await proc2.communicate(input=stdout)
-
-        if proc2.returncode != 0 or not png_data:
+        if proc.returncode != 0 or not png_data:
             return None
 
         return base64.b64encode(png_data).decode("ascii")
